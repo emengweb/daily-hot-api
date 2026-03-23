@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   daily-hot-api:
-    #build: .
+    build: .
     image: emengweb/daily-hot-api:latest
     ports:
       - "4000:4000"

@@ -8,17 +8,114 @@ import { fetchHotList } from "./providers/index.js";
 import { HOT_SOURCES } from "./sources.js";
 import type { HotListItem } from "./types.js";
 
+// Logger function
+const logger = {
+  info: (message: string, data?: any) => {
+    console.log(`[INFO] ${new Date().toISOString()} - ${message}`, data ? JSON.stringify(data) : '');
+  },
+  error: (message: string, error?: Error) => {
+    console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, error ? error.stack : '');
+  },
+  warn: (message: string, data?: any) => {
+    console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, data ? JSON.stringify(data) : '');
+  }
+};
+
 const cache = new TtlCache<HotListItem[]>();
 const app = new Hono();
+
+// Request size limit middleware
+app.use('*', async (c, next) => {
+  const contentLength = c.req.header('Content-Length');
+  const maxSize = 1024 * 1024; // 1MB
+  
+  if (contentLength) {
+    const length = parseInt(contentLength, 10);
+    if (length > maxSize) {
+      return c.json({ error: 'Request body too large' }, 413);
+    }
+  }
+  
+  await next();
+});
+
+// Rate limiting middleware
+const rateLimitMap = new Map<string, { count: number; lastReset: number }>();
+const RATE_LIMIT = 60; // requests per minute
+const WINDOW_MS = 60 * 1000; // 1 minute
+
+app.use('*', async (c, next) => {
+  const ip = c.req.header('X-Forwarded-For') || c.req.header('X-Real-IP') || c.req.raw.ip || 'unknown';
+  const now = Date.now();
+  
+  let rateLimit = rateLimitMap.get(ip);
+  if (!rateLimit) {
+    rateLimit = { count: 0, lastReset: now };
+    rateLimitMap.set(ip, rateLimit);
+  }
+  
+  // Reset counter if window has passed
+  if (now - rateLimit.lastReset > WINDOW_MS) {
+    rateLimit.count = 0;
+    rateLimit.lastReset = now;
+  }
+  
+  // Check rate limit
+  if (rateLimit.count >= RATE_LIMIT) {
+    return c.json({ error: 'Rate limit exceeded' }, 429);
+  }
+  
+  // Increment counter
+  rateLimit.count++;
+  
+  // Set rate limit headers
+  c.header('X-RateLimit-Limit', String(RATE_LIMIT));
+  c.header('X-RateLimit-Remaining', String(RATE_LIMIT - rateLimit.count));
+  c.header('X-RateLimit-Reset', String(Math.floor((rateLimit.lastReset + WINDOW_MS) / 1000)));
+  
+  await next();
+});
 
 // CORS middleware
 app.use('*', async (c, next) => {
   c.header('Access-Control-Allow-Origin', '*');
+  // const allowedOrigins = ['http://localhost:3000', 'http://localhost:8080', 'https://yourdomain.com'];
+  // const origin = c.req.header('Origin');
+  
+  // if (origin && allowedOrigins.includes(origin)) {
+  //   c.header('Access-Control-Allow-Origin', origin);
+  // }
+  
   c.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   c.header('Access-Control-Allow-Headers', 'Content-Type');
+  c.header('Access-Control-Allow-Credentials', 'true');
+  
   if (c.req.method === 'OPTIONS') {
     return c.body(null, 204);
   }
+  await next();
+});
+
+// Security headers middleware
+app.use('*', async (c, next) => {
+  // X-Content-Type-Options: Prevents MIME-sniffing
+  c.header('X-Content-Type-Options', 'nosniff');
+  
+  // X-Frame-Options: Prevents clickjacking
+  c.header('X-Frame-Options', 'DENY');
+  
+  // X-XSS-Protection: Enables browser XSS filtering
+  c.header('X-XSS-Protection', '1; mode=block');
+  
+  // Content-Security-Policy: Reduces the risk of XSS and other attacks
+  c.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:");
+  
+  // Referrer-Policy: Controls how much referrer information is sent
+  c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+  
+  // Strict-Transport-Security: Enforces HTTPS
+  c.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  
   await next();
 });
 
@@ -36,7 +133,15 @@ app.get('/cache/stats', (c) => {
   return c.json(cache.stats, 200);
 });
 
+// Cache clear endpoint with authentication
 app.get('/cache/clear', (c) => {
+  const apiKey = c.req.header('X-API-Key');
+  const expectedApiKey = process.env.API_KEY || 'default-api-key'; // Change this in production
+  
+  if (!apiKey || apiKey !== expectedApiKey) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+  
   cache.clear();
   return c.json({ ok: true }, 200);
 });
@@ -55,8 +160,29 @@ app.get('/:sources', async (c) => {
     const merge = c.req.query('merge') === 'true';
     const fields = c.req.query('fields') ? c.req.query('fields')?.split(',').map(f => f.trim()) : undefined;
 
+    logger.info('Received request for hot list', { sources, limit, forceRefresh, merge });
+
     if (sources.length === 0) {
+      logger.warn('Missing required parameter: sources');
       return c.json({ error: "Missing required parameter: sources" }, 400);
+    }
+    
+    // Validate limit parameter
+    if (limit !== undefined && (isNaN(limit) || limit < 1 || limit > 200)) {
+      logger.warn('Invalid limit parameter', { limit });
+      return c.json({ error: "Invalid limit parameter. Must be between 1 and 100" }, 400);
+    }
+    
+    // Validate timeoutMs parameter
+    if (timeoutMs !== undefined && (isNaN(timeoutMs) || timeoutMs < 1000 || timeoutMs > 60000)) {
+      logger.warn('Invalid timeoutMs parameter', { timeoutMs });
+      return c.json({ error: "Invalid timeoutMs parameter. Must be between 1000 and 60000" }, 400);
+    }
+    
+    // Validate concurrency parameter
+    if (concurrency !== undefined && (isNaN(concurrency) || concurrency < 1 || concurrency > 20)) {
+      logger.warn('Invalid concurrency parameter', { concurrency });
+      return c.json({ error: "Invalid concurrency parameter. Must be between 1 and 20" }, 400);
     }
 
     // 处理字段过滤函数
@@ -181,6 +307,7 @@ app.get('/:sources', async (c) => {
       results,
     }, 200);
   } catch (error) {
+    logger.error('Error processing request', error instanceof Error ? error : new Error(String(error)));
     return c.json({ error: error instanceof Error ? error.message : String(error) }, 500);
   }
 });
@@ -200,6 +327,21 @@ app.get('/rss/:sources', async (c) => {
 
     if (sources.length === 0) {
       return c.json({ error: "Missing required parameter: sources" }, 400);
+    }
+    
+    // Validate limit parameter
+    if (limit !== undefined && (isNaN(limit) || limit < 1 || limit > 200)) {
+      return c.json({ error: "Invalid limit parameter. Must be between 1 and 100" }, 400);
+    }
+    
+    // Validate timeoutMs parameter
+    if (timeoutMs !== undefined && (isNaN(timeoutMs) || timeoutMs < 1000 || timeoutMs > 60000)) {
+      return c.json({ error: "Invalid timeoutMs parameter. Must be between 1000 and 60000" }, 400);
+    }
+    
+    // Validate concurrency parameter
+    if (concurrency !== undefined && (isNaN(concurrency) || concurrency < 1 || concurrency > 20)) {
+      return c.json({ error: "Invalid concurrency parameter. Must be between 1 and 20" }, 400);
     }
 
     // 单个来源的处理逻辑
@@ -299,6 +441,7 @@ app.get('/rss/:sources', async (c) => {
       { 'Content-Type': 'application/rss+xml; charset=utf-8' }
     );
   } catch (error) {
+    logger.error('Error processing request', error instanceof Error ? error : new Error(String(error)));
     return c.json({ error: error instanceof Error ? error.message : String(error) }, 500);
   }
 });
@@ -352,12 +495,15 @@ ${rssItems}
 
 // XML转义函数
 function escapeXml(unsafe: string): string {
-  return unsafe
+  if (!unsafe) return '';
+  return String(unsafe)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+    .replace(/'/g, "&#039;")
+    .replace(/\s+/g, ' ') // Normalize whitespace
+    .trim();
 }
 
 // Default response

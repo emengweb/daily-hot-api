@@ -12,14 +12,14 @@
     "dev": "bun --watch src/index.ts"
   },
   "dependencies": {
-    "cheerio": "^1.1.2",
+    "cheerio": "^1.2.0",
     "crypto-js": "^4.2.0",
-    "dayjs": "^1.11.19",
+    "dayjs": "^1.11.20",
     "dotenv": "^17.3.1",
-    "hono": "^4.12.8"
+    "hono": "^4.12.9"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "typescript": "^5.0.0"
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3"
   }
 }
