@@ -666,6 +666,7 @@ export const providers: Record<string, HotListProvider> = {
       return {
         id: v.articleDetailUrl,
         title: v.articleTitle,
+        pic: v.picList?.[0],
         tip: v.pcHotRankScore,
         url: v.articleDetailUrl,
         mobileUrl: v.articleDetailUrl,

@@ -185,11 +185,186 @@ app.get('/:sources', async (c) => {
   }
 });
 
+// RSS feed endpoint
+app.get('/rss/:sources', async (c) => {
+  try {
+    const sourceStr = c.req.param('sources');
+    const sources = sourceStr.split(',').map(s => s.trim());
+    
+    const limit = c.req.query('limit') ? Number(c.req.query('limit')) : undefined;
+    const cacheTtlMs = c.req.query('cacheTtlMs') ? Number(c.req.query('cacheTtlMs')) : config.cacheTtlMs;
+    const forceRefresh = c.req.query('forceRefresh') === 'true';
+    const timeoutMs = c.req.query('timeoutMs') ? Number(c.req.query('timeoutMs')) : undefined;
+    const concurrency = c.req.query('concurrency') ? Number(c.req.query('concurrency')) : undefined;
+    const merge = c.req.query('merge') === 'true';
+
+    if (sources.length === 0) {
+      return c.json({ error: "Missing required parameter: sources" }, 400);
+    }
+
+    // 单个来源的处理逻辑
+    if (sources.length === 1) {
+      const source = sources[0];
+      const cacheKey = JSON.stringify({ source });
+      const cached = await cache.getOrSet(
+        cacheKey,
+        cacheTtlMs,
+        () => fetchHotList(source, { timeoutMs: timeoutMs ?? config.timeoutMs }),
+        { forceRefresh }
+      );
+
+      let data = limit ? cached.value.slice(0, limit) : cached.value;
+      
+      const updateTime = new Date(cached.expiresAt - cacheTtlMs).toISOString();
+      return c.body(
+        generateRssFeed(source, data, updateTime),
+        200,
+        { 'Content-Type': 'application/rss+xml; charset=utf-8' }
+      );
+    }
+
+    // 计算最小expiresAt值以确定updateTime
+    const resultsWithExpiresAt = await runWithConcurrency(sources, concurrency ?? config.maxConcurrency, async (source: string, index: number) => {
+      try {
+        const cacheKey = JSON.stringify({ source });
+        const cached = await cache.getOrSet(
+          cacheKey,
+          cacheTtlMs,
+          () => fetchHotList(source, { timeoutMs: timeoutMs ?? config.timeoutMs }),
+          { forceRefresh }
+        );
+        
+        // 计算每个源应分配的limit数量
+        let sourceLimit: number | undefined;
+        if (limit) {
+          const baseLimit = Math.floor(limit / sources.length);
+          const remainder = limit % sources.length;
+          sourceLimit = baseLimit + (index < remainder ? 1 : 0);
+        }
+        
+        return {
+          items: sourceLimit ? cached.value.slice(0, sourceLimit) : cached.value,
+          expiresAt: cached.expiresAt
+        };
+      } catch (error) {
+        return { items: [], expiresAt: Date.now() + cacheTtlMs };
+      }
+    });
+    
+    // 提取items和计算最小expiresAt
+    const itemsList = resultsWithExpiresAt.map(r => r.items);
+    const expiresAtValues = resultsWithExpiresAt.map(r => r.expiresAt);
+    const minExpiresAt = Math.min(...expiresAtValues);
+    const updateTime = new Date(minExpiresAt - cacheTtlMs).toISOString();
+    
+    // 合并多个来源的数据
+    let allItems: HotListItem[] = [];
+    if (merge) {
+      // 合并所有来源的数据
+      itemsList.forEach((items, index) => {
+        const source = sources[index];
+        const itemsWithSource = items.map(item => ({
+          ...item,
+          source
+        }));
+        allItems = [...allItems, ...itemsWithSource];
+      });
+      
+      // 按热度排序（如果有hot字段）
+      allItems.sort((a, b) => {
+        const hotA = typeof a.hot === 'string' ? parseInt(a.hot) : a.hot || 0;
+        const hotB = typeof b.hot === 'string' ? parseInt(b.hot) : b.hot || 0;
+        return hotB - hotA;
+      });
+      
+      // 应用limit
+      if (limit) {
+        allItems = allItems.slice(0, limit);
+      }
+    } else {
+      // 不合并，按来源顺序添加
+      itemsList.forEach((items, index) => {
+        const source = sources[index];
+        const itemsWithSource = items.map(item => ({
+          ...item,
+          source
+        }));
+        allItems = [...allItems, ...itemsWithSource];
+      });
+    }
+
+    return c.body(
+      generateRssFeed(sources.join(','), allItems, updateTime),
+      200,
+      { 'Content-Type': 'application/rss+xml; charset=utf-8' }
+    );
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+});
+
+// 获取来源标签的函数
+function getSourceLabel(sourceInput: string): string {
+  const sources = sourceInput.split(',');
+  const labels = sources.map(sourceId => {
+    const source = HOT_SOURCES.find(s => s.id === sourceId.trim());
+    return source ? source.label + `-${source.tip}` || source.label : sourceId.trim();
+  });
+  return labels.join(', ');
+}
+
+// 生成RSS feed的函数
+function generateRssFeed(source: string, items: HotListItem[], updateTime?: string): string {
+  const now = updateTime || new Date().toISOString();
+  const sourceLabel = getSourceLabel(source);
+  const feedTitle = `Daily Hot - ${sourceLabel}`;
+  const feedDescription = `Hot trends from ${sourceLabel}`;
+  const feedLink = `/${source}`;
+  
+  const rssItems = items.map(item => {
+    const title = escapeXml(item.title || '');
+    const link = item.url || item.mobileUrl || '';
+    const description = escapeXml(item.desc || item.title || '');
+    const pubDate = new Date().toUTCString();
+    const guid = item.id ? item.id.toString() : link;
+    
+    return `    <item>
+      <title>${title}</title>
+      <link>${link}</link>
+      <description>${description}</description>
+      <pubDate>${pubDate}</pubDate>
+      <guid>${guid}</guid>
+    </item>`;
+  }).join('\n');
+  
+  return `<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0">
+  <channel>
+    <title>${feedTitle}</title>
+    <description>${feedDescription}</description>
+    <link>${feedLink}</link>
+    <lastBuildDate>${now}</lastBuildDate>
+    <pubDate>${now}</pubDate>
+${rssItems}
+  </channel>
+</rss>`;
+}
+
+// XML转义函数
+function escapeXml(unsafe: string): string {
+  return unsafe
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 // Default response
 app.get('*', (c) => {
   return c.json({ message: "Welcome to Daily Hot API" }, 200);
 });
 
 const port = 4000;
-console.log(`Server running on http://localhost:${port}`);
+console.log(`Server running on port :${port}`);
 export default { port, fetch: app.fetch };
