@@ -1,0 +1,25 @@
+{
+  "name": "daily-hot-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "daily-hot-api": "dist/index.js"
+  },
+  "scripts": {
+    "build": "bun x tsc -p tsconfig.json",
+    "start": "bun src/index.js",
+    "dev": "bun --watch src/index.ts"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "crypto-js": "^4.2.0",
+    "dayjs": "^1.11.19",
+    "dotenv": "^17.3.1",
+    "hono": "^4.12.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  }
+}
