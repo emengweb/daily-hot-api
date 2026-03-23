@@ -7,7 +7,7 @@ COPY package.json bun.lock tsconfig.json ./
 COPY src ./src
 
 RUN bun install
-RUN bun run build
+# RUN bun run build
 
 EXPOSE 4000
 
