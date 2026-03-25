@@ -5,6 +5,6 @@ services:
     build: .
     image: emengweb/daily-hot-api:latest
     ports:
-      - "4000:4000"
+      - "4600:4000"
     environment:
       - NODE_ENV=production
